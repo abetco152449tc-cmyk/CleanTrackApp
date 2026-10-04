@@ -41,3 +41,15 @@ example
 # generated native folders
 /ios
 /android
+
+.tools/
+.codex-logs/
+
+/test-results/
+/playwright-report/
+
+/server/data/
+.env
+firebase-debug.log
+firestore-debug.log
+ui-debug.log

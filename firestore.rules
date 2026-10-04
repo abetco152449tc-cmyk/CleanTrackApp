@@ -1,0 +1,158 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function self(uid) { return signedIn() && request.auth.uid == uid; }
+    function person(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function role() { return signedIn() ? person(request.auth.uid).role : ''; }
+    function admin() { return role() == 'Admin'; }
+    function text(value, max) { return value is string && value.size() > 0 && value.size() <= max; }
+    function canReadReport(r) {
+      return signedIn() && (admin() || (role() == 'Resident' && r.resident == request.auth.uid)
+        || (role() == 'Collector' && r.collector == request.auth.uid));
+    }
+    match /users/{uid} {
+      allow get: if self(uid) || admin();
+      allow list: if admin();
+      function validUser(d) {
+        return d.keys().hasAll(['id','name','email','phone','role','joinedAt'])
+          && d.keys().hasOnly(['id','name','email','phone','role','joinedAt'])
+          && d.id == uid && text(d.name, 100) && text(d.email, 254)
+          && d.phone is string && d.phone.size() <= 30
+          && d.role in ['Resident','Collector','Admin'] && d.joinedAt is timestamp;
+      }
+      allow create: if self(uid) && validUser(request.resource.data)
+        && request.resource.data.role == 'Resident'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.joinedAt == request.time;
+      allow update: if validUser(request.resource.data) && (
+        (self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','phone']))
+        || (admin() && uid != request.auth.uid && resource.data.role == 'Resident'
+          && request.resource.data.role == 'Collector'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role']))
+      );
+      // Administrators are provisioned by the project owner, never through client self-registration.
+      allow delete: if false;
+      match /reads/{reportId} {
+        allow read: if self(uid);
+        function validRead() {
+          return request.resource.data.keys().hasOnly(['revision'])
+            && request.resource.data.revision is int && request.resource.data.revision >= 1
+            && canReadReport(get(/databases/$(database)/documents/reports/$(reportId)).data)
+            && request.resource.data.revision <= get(/databases/$(database)/documents/reports/$(reportId)).data.revision;
+        }
+        allow create: if self(uid) && validRead();
+        allow update: if self(uid) && validRead()
+          && request.resource.data.revision >= resource.data.revision;
+        allow delete: if false;
+      }
+      match /devices/{deviceId} {
+        allow read, delete: if self(uid);
+        allow create, update: if self(uid)
+          && request.resource.data.keys().hasOnly(['token','platform','updatedAt'])
+          && request.resource.data.token is string && request.resource.data.token.size() <= 200
+          && request.resource.data.token.matches('(ExponentPushToken|ExpoPushToken)\\[[-A-Za-z0-9_]+\\]')
+          && request.resource.data.platform in ['android','ios']
+          && request.resource.data.updatedAt == request.time;
+      }
+    }
+    match /reports/{reportId} {
+      allow read: if canReadReport(resource.data);
+      allow get: if role() == 'Resident' && !exists(/databases/$(database)/documents/reports/$(reportId));
+      function validReport(d) {
+        return d.keys().hasAll(['id','title','type','description','address','resident','residentName','collector','collectorName','status','created','createdAt','updatedAt','revision','history','hasPhoto'])
+          && d.keys().hasOnly(['id','title','type','description','address','resident','residentName','collector','collectorName','status','created','createdAt','updatedAt','revision','history','hasPhoto','latitude','longitude','locationAccuracy','locationSource','hasCompletionPhoto','photosExpiredAt'])
+          && (!('photosExpiredAt' in d) || d.photosExpiredAt is string)
+          && (!('locationAccuracy' in d) || (d.locationAccuracy is number && d.locationAccuracy >= 0 && d.locationAccuracy <= 100000 && 'latitude' in d))
+          && (!('locationSource' in d) || (d.locationSource in ['gps','map','address'] && (d.locationSource == 'address' ? !('latitude' in d) : 'latitude' in d)))
+          && (!('hasCompletionPhoto' in d) || (d.hasCompletionPhoto == true && d.status == 'Resolved'))
+          && d.id == reportId && text(d.title,80) && text(d.description,500) && text(d.address,500)
+          && d.type in ['General Waste','Recyclables','Illegal Dumping','Others']
+          && text(d.resident,128) && text(d.residentName,100)
+          && (d.collector == null || text(d.collector,128))
+          && d.collectorName is string && d.collectorName.size() <= 100
+          && d.status in ['Submitted','Under Review','Assigned','In Progress','Resolved','Rejected']
+          && text(d.created,30) && d.createdAt is timestamp && d.updatedAt == request.time
+          && d.revision is int && d.revision >= 1 && d.revision <= 100
+          && d.history is list && d.history.size() == d.revision && d.hasPhoto == true
+          && ((!('latitude' in d) && !('longitude' in d)) ||
+            (d.latitude is number && d.longitude is number && d.latitude >= -90 && d.latitude <= 90 && d.longitude >= -180 && d.longitude <= 180));
+      }
+      function validEvent(d) {
+        let h = d.history[d.history.size()-1];
+        return h.keys().hasOnly(['status','date','note','actor','collector']) && h.status == d.status
+          && (!('collector' in h) || (d.status == 'Assigned' && h.collector == d.collector))
+          && h.actor == request.auth.uid && text(h.date,30) && text(h.note,1000);
+      }
+      allow create: if role() == 'Resident' && validReport(request.resource.data)
+        && validEvent(request.resource.data) && request.resource.data.resident == request.auth.uid
+        && request.resource.data.residentName == person(request.auth.uid).name
+        && request.resource.data.status == 'Submitted' && request.resource.data.revision == 1
+        && !('hasCompletionPhoto' in request.resource.data)
+        && !('photosExpiredAt' in request.resource.data)
+        && request.resource.data.collector == null && request.resource.data.collectorName == ''
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/reports/$(reportId)/evidence/main);
+      function adminTransition(d) {
+        return admin() && (
+          (d.status == 'Under Review' && resource.data.status == 'Submitted' && d.collector == resource.data.collector && d.collectorName == resource.data.collectorName)
+          || (d.status == 'Rejected' && resource.data.status in ['Submitted','Under Review'] && d.collector == resource.data.collector && d.collectorName == resource.data.collectorName)
+          || (d.status == 'Assigned' && resource.data.status in ['Submitted','Under Review','Assigned']
+            && existsAfter(/databases/$(database)/documents/reports/$(reportId)/notifications/$(string(d.revision)))
+            && d.collector is string && person(d.collector).role == 'Collector' && d.collectorName == person(d.collector).name)
+        );
+      }
+      function collectorTransition(d) {
+        return role() == 'Collector' && resource.data.collector == request.auth.uid
+          && d.collector == resource.data.collector && d.collectorName == resource.data.collectorName
+          && ((resource.data.status == 'Assigned' && d.status == 'In Progress')
+            || (resource.data.status == 'In Progress' && d.status == 'Resolved'
+              && d.hasCompletionPhoto == true
+              && d.history[d.history.size()-1].note.size() <= 500
+              && existsAfter(/databases/$(database)/documents/reports/$(reportId)/evidence/completion)
+              && existsAfter(/databases/$(database)/documents/reports/$(reportId)/notifications/$(string(d.revision)))));
+      }
+      allow update: if validReport(request.resource.data) && validEvent(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','collector','collectorName','history','revision','updatedAt','hasCompletionPhoto'])
+        && request.resource.data.revision == resource.data.revision + 1
+        && request.resource.data.history == resource.data.history.concat([request.resource.data.history[resource.data.history.size()]])
+        && (adminTransition(request.resource.data) || collectorTransition(request.resource.data));
+      allow delete: if false;
+      match /notifications/{eventId} {
+        function validNotification() {
+          let r = getAfter(/databases/$(database)/documents/reports/$(reportId)).data;
+          let d = request.resource.data;
+          return d.keys().hasOnly(['reportId','revision','status','resident','collector','createdAt','nextAttemptAt','state'])
+            && d.reportId == reportId && d.revision == r.revision && eventId == string(r.revision)
+            && d.status == r.status && d.resident == r.resident && d.collector == r.collector
+            && d.state == 'queued' && d.createdAt == request.time && d.nextAttemptAt == request.time
+            && r.updatedAt == request.time
+            && r.revision == get(/databases/$(database)/documents/reports/$(reportId)).data.revision + 1
+            && ((d.status == 'Assigned' && admin()) ||
+              (d.status == 'Resolved' && role() == 'Collector' && r.collector == request.auth.uid));
+        }
+        allow create: if signedIn() && validNotification();
+        allow read, update, delete: if false;
+      }
+      match /evidence/{imageId} {
+        allow get: if imageId in ['main','completion'] && canReadReport(get(/databases/$(database)/documents/reports/$(reportId)).data);
+        function validPhoto() {
+          return request.resource.data.keys().hasOnly(['dataUrl'])
+            && request.resource.data.dataUrl is string
+            && request.resource.data.dataUrl.size() <= 240000
+            && request.resource.data.dataUrl.matches('data:image/jpeg;base64,[A-Za-z0-9+/=]+');
+        }
+        allow create: if validPhoto() && ((imageId == 'main' && role() == 'Resident'
+          && getAfter(/databases/$(database)/documents/reports/$(reportId)).data.resident == request.auth.uid
+          && getAfter(/databases/$(database)/documents/reports/$(reportId)).data.createdAt == request.time)
+          || (imageId == 'completion' && role() == 'Collector'
+            && get(/databases/$(database)/documents/reports/$(reportId)).data.collector == request.auth.uid
+            && get(/databases/$(database)/documents/reports/$(reportId)).data.status == 'In Progress'
+            && getAfter(/databases/$(database)/documents/reports/$(reportId)).data.status == 'Resolved'
+            && getAfter(/databases/$(database)/documents/reports/$(reportId)).data.hasCompletionPhoto == true
+            && getAfter(/databases/$(database)/documents/reports/$(reportId)).data.updatedAt == request.time));
+        allow list, update, delete: if false;
+      }
+    }
+  }
+}
